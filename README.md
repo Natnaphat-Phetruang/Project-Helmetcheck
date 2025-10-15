@@ -21,6 +21,7 @@
 - เมื่อ Run มาถึง  Cell 1 — Kaggle API (Drive fallback)
 - จะมี pop-up ขอใช้ใน google drive ให้อนุญาต
 - ตรงส่วนด้านล่างของ Cell จะมีให้ใส่ไฟล์ kaggle.json เพื่อใช้ในการ Download Dataset
+- (Data Set) https://www.kaggle.com/datasets/muhammetzahitaydn/hardhat-vest-dataset-v3
 
 3. เทรนโมเดล YOLO
 - เมื่อ Run มาถึง  Cell 5 — Train YOLOv8
