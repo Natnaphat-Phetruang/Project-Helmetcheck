@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, time
+import argparse, json, time, os, csv, logging, re
 from datetime import datetime
 from pathlib import Path
 from collections import Counter, deque
@@ -80,7 +80,6 @@ def now_stamp():
     dt = datetime.now()
     return dt.strftime("%Y%m%d-%H%M%S"), f"{int(dt.microsecond/1000):03d}"
 
-# ---- quality & alignment (ใช้ใน still-verify) ----
 def laplacian_var(gray):
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
@@ -115,6 +114,100 @@ def align_by_eyes(bgr, output_size=(160,160)):
         M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
         rot = cv2.warpAffine(bgr, M, (w, h), borderMode=cv2.BORDER_REFLECT101)
         return cv2.resize(cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY), output_size), True
+
+def slugify_name(name: str) -> str:
+    # ไว้ใช้ในชื่อไฟล์รูป
+    s = name.strip()
+    s = re.sub(r"[^\w\s\-ก-๙]", "", s, flags=re.UNICODE)  # keep th/en letters, digits, _
+    s = re.sub(r"\s+", "_", s)
+    if not s:
+        s = "Unknown"
+    return s[:60]
+
+# ---------------- logging helper ----------------
+class CsvImageLogger:
+    """
+    บันทึก CSV (หัวคอลัมน์ภาษาไทย) + เซฟภาพครอปหน้า
+    - CSV ต่อวัน: logs/csv/events_YYYYMMDD.csv (utf-8-sig)
+    - รูป: logs/faces/YYYYMMDD/YYYYMMDD-HHMMSS_name_HELMET|NOHELMET.jpg
+    """
+    def __init__(self, root: Path, suppress_seconds: float = 20.0):
+        self.root = Path(root)
+        (self.root / "csv").mkdir(parents=True, exist_ok=True)
+        (self.root / "faces").mkdir(parents=True, exist_ok=True)
+        self.suppress_seconds = float(suppress_seconds)
+        self.last_logged_at: dict[str, float] = {}  # per name
+
+        self._open_csv_for_today()
+
+    def _open_csv_for_today(self):
+        today = datetime.now().strftime("%Y%m%d")
+        self._csv_path = self.root / "csv" / f"events_{today}.csv"
+        new_file = not self._csv_path.exists() or self._csv_path.stat().st_size == 0
+        # utf-8-sig เพื่อ Excel
+        self._csv_fp = open(self._csv_path, "a", newline="", encoding="utf-8-sig")
+        self._csv_writer = csv.writer(self._csv_fp)
+        if new_file:
+            self._csv_writer.writerow(["วัน", "เวลา", "ชื่อ-นามสกุล", "ตรวจพบหมวกหรือไม่"])
+            self._csv_fp.flush()
+
+    def _rollover_if_new_day(self):
+        # ถ้าวันเปลี่ยน ให้เปิดไฟล์ใหม่ (ในกรณีแอปรันข้ามวัน)
+        today = datetime.now().strftime("%Y%m%d")
+        if not self._csv_path.name.startswith(f"events_{today}"):
+            try:
+                self._csv_fp.close()
+            except Exception:
+                pass
+            self._open_csv_for_today()
+
+    def should_log(self, name: str) -> bool:
+        now = time.time()
+        last = self.last_logged_at.get(name)
+        if last is None:
+            return True
+        return (now - last) >= self.suppress_seconds
+
+    def write(self, name: str, helmet_text: str, frame_bgr: np.ndarray, face_box: tuple[int,int,int,int]):
+        """
+        ลงบันทึก 2 อย่าง:
+          1) CSV: วัน, เวลา, ชื่อ-นามสกุล, ตรวจพบหมวกหรือไม่
+          2) ภาพครอปหน้า: YYYYMMDD/YYYYMMDD-HHMMSS_name_HELMET|NOHELMET.jpg
+        """
+        # ป้องกัน Unknown / ค่าว่าง
+        name_out = name if (name and name != "Unknown") else "Unknown"
+        helmet_out = "มีหมวก" if helmet_text == "HELMET" else ("ไม่มีหมวก" if helmet_text == "NO HELMET" else "ไม่ทราบ")
+
+        # เวลา
+        dt = datetime.now()
+        day_str = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M:%S")
+
+        # 1) CSV
+        self._rollover_if_new_day()
+        self._csv_writer.writerow([day_str, time_str, name_out, helmet_out])
+        self._csv_fp.flush()
+
+        # 2) รูป (ครอปหน้า)
+        x1, y1, x2, y2 = face_box
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(frame_bgr.shape[1]-1, x2); y2 = min(frame_bgr.shape[0]-1, y2)
+        crop = frame_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = frame_bgr  # fallback เก็บทั้งเฟรม
+
+        day_folder = self.root / "faces" / dt.strftime("%Y%m%d")
+        day_folder.mkdir(parents=True, exist_ok=True)
+        name_slug = slugify_name(name_out)
+        fname = f"{dt.strftime('%Y%m%d-%H%M%S')}_{name_slug}_{'HELMET' if helmet_text=='HELMET' else ('NOHELMET' if helmet_text=='NO HELMET' else 'UNKNOWN')}.jpg"
+        out_path = day_folder / fname
+        try:
+            cv2.imwrite(str(out_path), crop)
+        except Exception as e:
+            print(f"[LOG][WARN] cannot save face image: {out_path} ({e})")
+
+        # timestamp กันซ้ำ
+        self.last_logged_at[name_out] = time.time()
 
 # ---------------- detectors ----------------
 class FaceDetector:
@@ -199,8 +292,9 @@ def run(weights: Path,
         verify_k: int = 8,
         verify_dist_thr: float = 100.0,
         verify_outdir: Path = PROJECT_ROOT / "logs" / "verify_queue",
+        # ---- logging options ----
+        suppress_seconds: float = 20.0,  # 20s/คน
         ):
-
     # OpenCV optimizations
     cv2.setUseOptimized(True)
     if cv2_threads >= 0:
@@ -209,8 +303,11 @@ def run(weights: Path,
     # Logs / dirs
     logdir = PROJECT_ROOT / "logs"
     logdir.mkdir(exist_ok=True)
-    screens_dir = logdir / "screens"; screens_dir.mkdir(exist_ok=True)
+    (logdir / "screens").mkdir(exist_ok=True)
     verify_dir = Path(verify_outdir); verify_dir.mkdir(parents=True, exist_ok=True)
+
+    # Event logger (CSV+Images)
+    csvimg_logger = CsvImageLogger(logdir, suppress_seconds=suppress_seconds)
 
     # ID model
     recog, labels = None, {}
@@ -318,7 +415,7 @@ def run(weights: Path,
         elif current_name!="Unknown" and current_name!=last_name:
             last_name,last_in_db,t_name = current_name,current_in_db,time.time()
 
-        # still-verify
+        # still-verify keep samples
         if boxes:
             x1,y1,x2,y2 = boxes[0]
             recent_samples.append((frame.copy(), (x1,y1,x2,y2), time.time()))
@@ -359,7 +456,6 @@ def run(weights: Path,
                 else:
                     helmet_text = "UNKNOWN"
             else:
-                # (cached majority buffer)
                 if len(helmet_buf):
                     helmet_text = "HELMET" if Counter(helmet_buf).most_common(1)[0][0]=="HELMET" else "NO HELMET"
 
@@ -369,16 +465,29 @@ def run(weights: Path,
             last_helmet, t_helmet = helmet_text, time.time()
 
         # ---------- 2.5) (name+helmet) ----------
-        now = time.time()
+        now_ts = time.time()
         both_green = (current_name != "Unknown" and current_in_db and helmet_text == "HELMET")
         if both_green:
-            combo_lock_until = now + float(combo_hold)
+            combo_lock_until = now_ts + float(combo_hold)
             combo_lock_name   = current_name
             combo_lock_helmet = "HELMET"
-        if now < combo_lock_until:
+        if now_ts < combo_lock_until:
             current_name  = combo_lock_name
             current_in_db = True
             helmet_text   = combo_lock_helmet
+
+        # ---------- 2.6) LOGGING per spec ----------
+        # เงื่อนไข: ตรวจพบ "หน้าของพนักงาน" (ต้องรู้จักชื่อใน DB) และ
+        # ไม่เคยลง log ภายใน suppress_seconds (ดีฟอลต์ 20s) ของคนนั้น
+        if boxes and current_in_db and current_name != "Unknown":
+            if csvimg_logger.should_log(current_name):
+                # เซฟ CSV + รูปครอปหน้า (ใช้กรอบกล่องใบหน้าที่ใหญ่สุดที่เลือกไว้)
+                csvimg_logger.write(
+                    name=current_name,
+                    helmet_text=helmet_text,
+                    frame_bgr=frame,
+                    face_box=boxes[0]
+                )
 
         # ---------- 3) Draw ----------
         canvas=frame.copy()
@@ -488,6 +597,8 @@ def parse_args():
     ap.add_argument("--verify-k", type=int, default=8)
     ap.add_argument("--verify-dist-thr", type=float, default=100.0)
     ap.add_argument("--verify-outdir", type=Path, default=(PROJECT_ROOT/"logs"/"verify_queue"))
+    # logging suppression window
+    ap.add_argument("--suppress-seconds", type=float, default=20.0, help="ห้ามลงซ้ำคนเดิมภายใน N วินาที")
     return ap.parse_args()
 
 if __name__=="__main__":
@@ -504,4 +615,5 @@ if __name__=="__main__":
         combo_hold=args.combo_hold,
         verify_k=args.verify_k,
         verify_dist_thr=args.verify_dist_thr,
-        verify_outdir=args.verify_outdir)
+        verify_outdir=args.verify_outdir,
+        suppress_seconds=args.suppress_seconds)
